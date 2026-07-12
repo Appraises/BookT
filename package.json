@@ -4,6 +4,13 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "ai": "python scripts/local_ai_service.py",
+    "ai:install-pl": "python scripts/install_translation_package.py pl en en pt",
+    "ai:install-pl-nlp": "python scripts/install_polish_nlp.py",
+    "ai:install-fr-nlp": "python scripts/install_french_nlp.py",
+    "ai:install-pl-grammar": "python scripts/install_polish_nlp.py && python scripts/install_walenty.py",
+    "db:migrate-learning": "node scripts/migrate_learning_model.mjs",
+    "db:repair-fr": "node scripts/repair_french_translations.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
@@ -11,11 +18,13 @@
   "dependencies": {
     "@prisma/client": "^6.19.2",
     "epubjs": "^0.3.93",
+    "jszip": "^3.10.1",
     "next": "16.1.6",
     "pdfjs-dist": "^5.5.207",
     "prisma": "^6.19.2",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "ts-fsrs": "^5.4.1"
   },
   "devDependencies": {
     "dotenv": "^17.3.1",

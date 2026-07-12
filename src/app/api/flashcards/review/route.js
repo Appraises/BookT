@@ -1,142 +1,101 @@
 import prisma from '@/lib/prisma';
 import { NextResponse } from 'next/server';
+import {
+    cardToMemoryData,
+    memoryKey,
+    scheduleReview,
+    SKILL,
+    statusFromSkillMemories,
+} from '@/lib/fsrs';
 
-/**
- * Anki-style SRS algorithm (SM-2 variant)
- * 
- * Buttons: Again (1), Hard (2), Good (3), Easy (4)
- * 
- * Again: interval = 1 min, ease -= 0.20
- * Hard:  interval = interval * 1.2, ease -= 0.15
- * Good:  interval = interval * ease (or graduating interval if new)
- * Easy:  interval = interval * ease * 1.3, ease += 0.15
- * 
- * Ease factor minimum: 1.3
- * 
- * Status progression:
- *   interval >= 21 days → status 4 (Known, removed from queue)
- *   interval >= 3 days  → status 3 (Familiar)
- *   otherwise           → status 2 (Recognized)
- */
-
-const MIN_EASE = 1.3;
-const GRADUATING_INTERVAL = 1;   // 1 day (first "Good" press)
-const EASY_INTERVAL = 4;          // 4 days (first "Easy" press)
-const FAMILIAR_THRESHOLD = 3;     // days → status 3
-const KNOWN_THRESHOLD = 21;       // days → status 4
-
-function computeSRS(currentInterval, currentEase, quality) {
-    let newInterval = currentInterval;
-    let newEase = currentEase;
-
-    switch (quality) {
-        case 1: // Again
-            newInterval = 1 / 1440; // 1 minute in days
-            newEase = Math.max(MIN_EASE, currentEase - 0.20);
-            break;
-
-        case 2: // Hard
-            if (currentInterval < 1) {
-                newInterval = 1 / 144; // 10 minutes
-            } else {
-                newInterval = currentInterval * 1.2;
-            }
-            newEase = Math.max(MIN_EASE, currentEase - 0.15);
-            break;
-
-        case 3: // Good
-            if (currentInterval < 1) {
-                // New/learning card → graduating interval
-                newInterval = GRADUATING_INTERVAL;
-            } else {
-                newInterval = currentInterval * currentEase;
-            }
-            // Ease stays the same
-            break;
-
-        case 4: // Easy
-            if (currentInterval < 1) {
-                newInterval = EASY_INTERVAL;
-            } else {
-                newInterval = currentInterval * currentEase * 1.3;
-            }
-            newEase = currentEase + 0.15;
-            break;
-
-        default:
-            break;
+async function resolveMemory(body) {
+    if (body.memoryKey) {
+        return prisma.skillMemory.findUnique({ where: { key: body.memoryKey } });
     }
-
-    // Determine status based on interval
-    let newStatus;
-    if (newInterval >= KNOWN_THRESHOLD) {
-        newStatus = '4'; // Known
-    } else if (newInterval >= FAMILIAR_THRESHOLD) {
-        newStatus = '3'; // Familiar
-    } else {
-        newStatus = '2'; // Recognized
+    if (body.lexemeId && body.skill) {
+        return prisma.skillMemory.findUnique({
+            where: { key: memoryKey(body.lexemeId, body.skill) },
+        });
     }
-
-    return { newInterval, newEase, newStatus };
+    if (body.word && body.language) {
+        const form = await prisma.userWord.findUnique({
+            where: { word_language: { word: body.word, language: body.language } },
+        });
+        if (!form?.lexemeId) return null;
+        return prisma.skillMemory.findUnique({
+            where: { key: memoryKey(form.lexemeId, body.skill || SKILL.RECOGNITION) },
+        });
+    }
+    return null;
 }
 
 // POST /api/flashcards/review
-// Body: { word, language, quality } where quality = 1 (Again), 2 (Hard), 3 (Good), 4 (Easy)
+// Body: { memoryKey, quality: 1..4 }
 export async function POST(request) {
     try {
-        const { word, language, quality } = await request.json();
-
-        if (!word || !language || !quality) {
-            return NextResponse.json(
-                { error: 'word, language, and quality are required' },
-                { status: 400 }
-            );
+        const body = await request.json();
+        const quality = body.quality;
+        if (!Number.isInteger(quality) || quality < 1 || quality > 4) {
+            return NextResponse.json({ error: 'quality (1..4) is required' }, { status: 400 });
         }
 
-        // Fetch current word state
-        const userWord = await prisma.userWord.findUnique({
-            where: { word_language: { word, language } },
-        });
-
-        if (!userWord) {
-            return NextResponse.json({ error: 'Word not found' }, { status: 404 });
+        const memory = await resolveMemory(body);
+        if (!memory) {
+            return NextResponse.json({ error: 'Skill memory not found' }, { status: 404 });
         }
 
-        const currentInterval = userWord.interval || 0;
-        const currentEase = userWord.easeFactor || 2.5;
-
-        const { newInterval, newEase, newStatus } = computeSRS(
-            currentInterval,
-            currentEase,
-            quality
-        );
-
-        // Calculate next review date
         const now = new Date();
-        const nextReview = new Date(now.getTime() + newInterval * 24 * 60 * 60 * 1000);
-
-        // Update the word
+        const scheduled = scheduleReview(memory, quality, now);
+        const data = cardToMemoryData(scheduled.card);
         const isCorrect = quality >= 3;
-        const updated = await prisma.userWord.update({
-            where: { word_language: { word, language } },
-            data: {
-                status: newStatus,
-                interval: newInterval,
-                easeFactor: newEase,
-                nextReview,
-                reviewCount: { increment: 1 },
-                correctCount: isCorrect ? { increment: 1 } : 0, // Reset on wrong
-                lastReviewed: now,
-            },
+        const updated = await prisma.$transaction(async (tx) => {
+            const next = await tx.skillMemory.update({
+                where: { id: memory.id },
+                data: {
+                    ...data,
+                    correctCount: isCorrect ? { increment: 1 } : undefined,
+                },
+            });
+            await tx.skillReview.create({
+                data: {
+                    memoryId: memory.id,
+                    rating: quality,
+                    state: scheduled.log.state,
+                    due: new Date(scheduled.log.due),
+                    stability: scheduled.log.stability,
+                    difficulty: scheduled.log.difficulty,
+                    elapsedDays: scheduled.log.elapsed_days,
+                    scheduledDays: scheduled.log.scheduled_days,
+                    reviewedAt: now,
+                },
+            });
+            return next;
         });
+
+        let status = null;
+        if (updated.lexemeId && updated.skill !== SKILL.GRAMMAR) {
+            const skills = await prisma.skillMemory.findMany({
+                where: { lexemeId: updated.lexemeId, skill: { in: [SKILL.RECOGNITION, SKILL.PRODUCTION] } },
+            });
+            status = statusFromSkillMemories(skills);
+            await prisma.$transaction([
+                prisma.lexeme.update({ where: { id: updated.lexemeId }, data: { status } }),
+                prisma.userWord.updateMany({
+                    where: { lexemeId: updated.lexemeId },
+                    data: { status, lastReviewed: now },
+                }),
+            ]);
+        }
 
         return NextResponse.json({
-            word: updated.word,
-            status: updated.status,
-            interval: newInterval,
-            easeFactor: newEase,
-            nextReview,
-            reviewCount: updated.reviewCount,
+            memoryKey: updated.key,
+            skill: updated.skill,
+            status,
+            due: updated.due,
+            stability: updated.stability,
+            difficulty: updated.difficulty,
+            reps: updated.reps,
+            lapses: updated.lapses,
         });
     } catch (error) {
         console.error('Review error:', error);

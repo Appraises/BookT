@@ -1,0 +1,7 @@
+faster-whisper>=1.2.1
+flask>=3.1.3
+argostranslate>=1.11.0
+morfeusz2>=1.99.15
+stanza>=1.10.1
+verbecc>=2.0.2
+tzdata>=2025.1

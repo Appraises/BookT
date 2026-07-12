@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { writeFile, mkdir } from 'fs/promises';
 import path from 'path';
 import prisma from '@/lib/prisma';
+import { aiFetch, AIServiceError } from '@/lib/aiService';
 
 // POST /api/books/[id]/audio — Upload audio file and trigger alignment
 export async function POST(request, { params }) {
@@ -45,56 +46,41 @@ export async function POST(request, { params }) {
         const pageTexts = book.pages.map(p => p.content);
 
         try {
-            const alignRes = await fetch('http://127.0.0.1:8000/align', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    audio_path: filePath,
-                    pages: pageTexts,
-                    language: book.language,
-                }),
+            const alignRes = await aiFetch('/align', {
+                body: { audio_path: filePath, pages: pageTexts, language: book.language },
+                timeoutMs: 1800000, // 30 min — audiobooks are long
             });
+            const alignData = await alignRes.json();
 
-            if (alignRes.ok) {
-                const alignData = await alignRes.json();
+            // Clear any old sync data for this book
+            await prisma.audioSync.deleteMany({ where: { bookId } });
 
-                // Clear any old sync data for this book
-                await prisma.audioSync.deleteMany({ where: { bookId } });
-
-                // Store alignment entries
-                if (alignData.alignment && alignData.alignment.length > 0) {
-                    await prisma.audioSync.createMany({
-                        data: alignData.alignment.map(entry => ({
-                            bookId,
-                            pageNumber: entry.pageNumber,
-                            startTime: entry.startTime,
-                            endTime: entry.endTime,
-                            text: entry.text,
-                        })),
-                    });
-                }
-
-                return NextResponse.json({
-                    audioUrl,
-                    syncCount: alignData.alignment?.length || 0,
-                    duration: alignData.duration,
-                    status: 'synced',
-                });
-            } else {
-                const err = await alignRes.text();
-                console.error('Alignment failed:', err);
-                return NextResponse.json({
-                    audioUrl,
-                    status: 'uploaded_no_sync',
-                    error: 'Alignment failed — audio uploaded but sync not available',
+            const entries = alignData.alignment || [];
+            if (entries.length > 0) {
+                await prisma.audioSync.createMany({
+                    data: entries.map(entry => ({
+                        bookId,
+                        pageNumber: entry.pageNumber,
+                        startTime: entry.startTime,
+                        endTime: entry.endTime,
+                        text: entry.text,
+                    })),
                 });
             }
+
+            return NextResponse.json({
+                audioUrl,
+                syncCount: entries.length,
+                duration: alignData.duration,
+                status: entries.length > 0 ? 'synced' : 'uploaded_no_sync',
+            });
         } catch (alignErr) {
-            console.error('Alignment service unreachable:', alignErr.message);
+            const message = alignErr instanceof AIServiceError ? alignErr.message : 'Alignment failed';
+            console.error('Book alignment failed:', message);
             return NextResponse.json({
                 audioUrl,
                 status: 'uploaded_no_sync',
-                error: 'Python service unreachable — audio uploaded but sync not available',
+                error: message,
             });
         }
     } catch (error) {

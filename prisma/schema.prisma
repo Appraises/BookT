@@ -1,0 +1,210 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Book {
+  id          String      @id @default(cuid())
+  title       String
+  language    String
+  totalPages  Int
+  currentPage Int         @default(1)
+  audioUrl    String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  pages       Page[]
+  chapters    Chapter[]
+  audioSyncs  AudioSync[]
+  userWords   UserWord[]
+}
+
+model Page {
+  id         String @id @default(cuid())
+  bookId     String
+  pageNumber Int
+  content    String
+  book       Book   @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  @@unique([bookId, pageNumber], name: "bookId_pageNumber")
+  @@index([bookId])
+}
+
+model Chapter {
+  id         String      @id @default(cuid())
+  bookId     String
+  number     Int
+  title      String
+  startPage  Int
+  endPage    Int
+  audioUrl   String?
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  book       Book        @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  audioSyncs AudioSync[]
+
+  @@unique([bookId, number])
+  @@index([bookId])
+}
+
+model AudioSync {
+  id         String   @id @default(cuid())
+  bookId     String
+  chapterId  String?
+  pageNumber Int
+  startTime  Float
+  endTime    Float
+  text       String
+  book       Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  chapter    Chapter? @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+
+  @@index([bookId, pageNumber])
+  @@index([chapterId])
+}
+
+model Word {
+  id          String   @id @default(cuid())
+  word        String
+  language    String
+  translation String
+  meanings    String   @default("[]")
+  ipa         String?
+  cachedAt    DateTime @default(now())
+
+  @@unique([word, language], name: "word_language")
+}
+
+model UserWord {
+  id              String    @id @default(cuid())
+  word            String
+  language        String
+  bookId          String?
+  // Knowledge level: 0 ignored, 1 new, 2 recognized, 3 familiar, 4 known
+  status          Int       @default(1)
+  // How many distinct page-views have shown this word (drives gentle promotion)
+  exposureCount   Int       @default(0)
+  // Context captured when the word was studied: the sentence it appeared in and
+  // (when the book has aligned audio) the clip that narrates that sentence.
+  contextSentence String?
+  contextAudioUrl String?
+  contextStart    Float?
+  contextEnd      Float?
+  firstSeen       DateTime  @default(now())
+  lastSeen        DateTime?
+  interval        Float     @default(0)
+  easeFactor      Float     @default(2.5)
+  nextReview      DateTime?
+  reviewCount     Int       @default(0)
+  correctCount    Int       @default(0)
+  lastReviewed    DateTime?
+  // Surface form metadata. Knowledge itself is tracked on Lexeme, while this
+  // row records which inflected spelling the reader actually encountered.
+  lemma           String?
+  partOfSpeech    String?
+  morphology      String?
+  isStudyable     Boolean   @default(true)
+  lexemeId        String?
+  book            Book?     @relation(fields: [bookId], references: [id], onDelete: SetNull)
+  lexeme          Lexeme?   @relation(fields: [lexemeId], references: [id], onDelete: SetNull)
+
+  @@unique([word, language], name: "word_language")
+  @@index([bookId])
+  @@index([language, status])
+  @@index([language, lemma])
+  @@index([lexemeId])
+  @@index([nextReview])
+}
+
+model Lexeme {
+  id              String             @id @default(cuid())
+  lemma           String
+  language        String
+  translation     String?
+  meanings        String             @default("[]")
+  ipa             String?
+  partOfSpeech    String?
+  status          Int                @default(1)
+  exposureCount   Int                @default(0)
+  contextSentence String?
+  contextAudioUrl String?
+  contextStart    Float?
+  contextEnd      Float?
+  firstSeen       DateTime           @default(now())
+  lastSeen        DateTime?
+  forms           UserWord[]
+  skills          SkillMemory[]
+  grammarItems    GrammarEncounter[]
+
+  @@unique([lemma, language], name: "lemma_language")
+  @@index([language, status])
+}
+
+model SkillMemory {
+  id                 String            @id @default(cuid())
+  key                String            @unique
+  skill              String
+  lexemeId           String?
+  grammarEncounterId String?           @unique
+  due                DateTime          @default(now())
+  stability          Float             @default(0)
+  difficulty         Float             @default(0)
+  elapsedDays        Int               @default(0)
+  scheduledDays      Int               @default(0)
+  reps               Int               @default(0)
+  lapses             Int               @default(0)
+  learningSteps      Int               @default(0)
+  state              Int               @default(0)
+  lastReview         DateTime?
+  correctCount       Int               @default(0)
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  lexeme             Lexeme?           @relation(fields: [lexemeId], references: [id], onDelete: Cascade)
+  grammarEncounter   GrammarEncounter? @relation(fields: [grammarEncounterId], references: [id], onDelete: Cascade)
+  reviews            SkillReview[]
+
+  @@index([skill, due])
+  @@index([lexemeId, skill])
+}
+
+model SkillReview {
+  id            String      @id @default(cuid())
+  memoryId      String
+  rating        Int
+  state         Int
+  due           DateTime
+  stability     Float
+  difficulty    Float
+  elapsedDays   Int
+  scheduledDays Int
+  reviewedAt    DateTime    @default(now())
+  memory        SkillMemory @relation(fields: [memoryId], references: [id], onDelete: Cascade)
+
+  @@index([memoryId, reviewedAt])
+}
+
+model GrammarEncounter {
+  id         String       @id @default(cuid())
+  lexemeId   String?
+  language   String
+  word       String
+  lemma      String
+  sentence   String
+  caseCode   String
+  caseLabel  String
+  pattern    String?
+  reason     String
+  source     String
+  confidence String       @default("medium")
+  seenCount  Int          @default(1)
+  firstSeen  DateTime     @default(now())
+  lastSeen   DateTime     @default(now())
+  lexeme     Lexeme?      @relation(fields: [lexemeId], references: [id], onDelete: SetNull)
+  memory     SkillMemory?
+
+  @@unique([language, word, sentence], name: "grammar_language_word_sentence")
+  @@index([language, caseCode])
+  @@index([lexemeId])
+}

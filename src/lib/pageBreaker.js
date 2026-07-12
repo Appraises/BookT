@@ -1,22 +1,16 @@
 /**
  * Smart page breaking with chapter detection.
- * Splits extracted PDF text into screen-sized pages,
+ * Splits extracted PDF/EPUB text into screen-sized pages,
  * with chapter headings always starting on a new page.
  */
 
-// Chapter heading patterns (multi-language)
+// Chapter headings: word + arabic or roman numeral ("CHAPTER 4", "Rozdział I")
+const ROMAN = '[IVXLCDM]+';
 const CHAPTER_PATTERNS = [
-    /^CHAPITRE\s+\d+/i,       // French
-    /^CHAPTER\s+\d+/i,        // English
-    /^CAPÍTULO\s+\d+/i,       // Portuguese/Spanish
-    /^KAPITEL\s+\d+/i,        // German
-    /^CAPITOLO\s+\d+/i,       // Italian
-    /^ГЛАВА\s+\d+/i,          // Russian
-    /^第\s*\d+\s*章/,          // Chinese/Japanese
-    /^PARTIE\s+\d+/i,         // French (Part)
-    /^PART\s+\d+/i,           // English (Part)
-    /^LIVRE\s+\d+/i,          // French (Book)
-    /^BOOK\s+\d+/i,           // English (Book)
+    new RegExp(`^(CHAPTER|CHAPITRE|CAP[ÍI]TULO|KAPITEL|CAPITOLO|ROZDZIA[ŁL]|HOOFDSTUK|ГЛАВА)[\\s.:]+(\\d+|${ROMAN})\\b`, 'iu'),
+    new RegExp(`^(PART|PARTIE|PARTE|CZ[ĘE][ŚS][ĆC]|TEIL|ЧАСТЬ)[\\s.:]+(\\d+|${ROMAN})\\b`, 'iu'),
+    new RegExp(`^(BOOK|LIVRE|LIBRO|LIVRO|BUCH|KSI[ĘE]GA|КНИГА)[\\s.:]+(\\d+|${ROMAN})\\b`, 'iu'),
+    /^第\s*\d+\s*章/, // Chinese/Japanese
 ];
 
 /**
@@ -26,19 +20,61 @@ function isChapterHeading(line) {
     const trimmed = line.trim();
     if (!trimmed) return false;
 
-    // Check known patterns
     for (const pattern of CHAPTER_PATTERNS) {
         if (pattern.test(trimmed)) return true;
     }
 
     // Heuristic: short ALL-CAPS line (likely a heading)
     if (trimmed.length < 80 && trimmed === trimmed.toUpperCase() && /[A-ZÀ-Ü]/.test(trimmed)) {
-        // Must have at least 2 "word" characters to avoid matching stray symbols
+        // Skip identifier-like lines (ISBN, serial numbers, years…)
+        if (/\d{3,}/.test(trimmed)) return false;
+        // Must have at least 3 letters to avoid matching stray symbols
         const wordChars = trimmed.replace(/[^A-ZÀ-Üa-zà-ü]/g, '');
         if (wordChars.length >= 3) return true;
     }
 
     return false;
+}
+
+// A localized "Chapter N" / "Chapitre IV" heading at the very start of a section.
+const CHAPTER_NUMBER_HEAD = new RegExp(
+    `^\\s*(?:CHAP(?:TER|ITRE)|CAP[ÍI]TULO|KAPITEL|CAPITOLO|ROZDZIA[ŁL]|HOOFDSTUK|ГЛАВА)[\\s.:]*(?:\\d+|${ROMAN})\\b`,
+    'iu'
+);
+// A bare leading chapter number + capitalized title ("1 Hibou express").
+const BARE_NUMBER_HEAD = /^\s*\d{1,3}[\s.):]+\p{Lu}/u;
+// Front-/back-matter giveaways: legal pages, contents, author bio.
+const MATTER_KEYWORDS = /(tous droits réservés|all rights reserved|dépôt légal|achevé d'imprimer|copyright|©|\bisbn\b|table des matières|table of contents|\bsommaire\b|about the author|about the publisher|l['’]auteur\b)/i;
+
+/**
+ * Classify an EPUB spine section as a real chapter or as front/back matter
+ * (cover, dedication, copyright, table of contents, author bio…).
+ *
+ * EPUB spines list front matter as their own sections, so numbering every
+ * section as "Chapter N" pushes the real chapters up by however many
+ * front-matter sections precede them — which silently misaligns per-chapter
+ * audio. Only sections classified as 'chapter' get a chapter number.
+ *
+ * @param {string} text - the section's plain text
+ * @param {number} index - its position in the spine (0-based)
+ * @param {number} total - number of spine sections
+ * @returns {'chapter' | 'matter'}
+ */
+export function classifyEpubSection(text, index, total) {
+    const trimmed = (text || '').trim();
+    if (!trimmed) return 'matter';
+
+    // A clear chapter heading always wins, even if the section is short.
+    if (CHAPTER_NUMBER_HEAD.test(trimmed) || BARE_NUMBER_HEAD.test(trimmed)) return 'chapter';
+
+    if (MATTER_KEYWORDS.test(trimmed)) return 'matter';
+
+    // Cover/dedication/half-title pages are short and cluster at the very ends
+    // of the spine. Real chapters are long, so a short edge section is matter.
+    const nearEdge = index < 4 || index >= total - 3;
+    if (nearEdge && trimmed.length < 350) return 'matter';
+
+    return 'chapter';
 }
 
 /**
@@ -50,17 +86,58 @@ function splitIntoParagraphs(text) {
 
     // If no paragraph breaks, split on single newlines
     if (paragraphs.length <= 1 && text.length > 500) {
-        return text.split(/\n/).map(p => p.trim()).filter(Boolean);
+        const byLine = text.split(/\n/).map(p => p.trim()).filter(Boolean);
+        if (byLine.length > 1) return byLine;
     }
 
     return paragraphs;
 }
 
 /**
- * Split extracted PDF text into readable pages.
- * 
- * @param {string} fullText - The complete text from one PDF page
- * @param {number} maxChars - Max characters per reading page (default ~1500)
+ * Break an oversized paragraph into chunks of at most maxChars,
+ * cutting on sentence boundaries (falling back to word boundaries).
+ * Extraction collapses whitespace, so a whole EPUB chapter often
+ * arrives as one giant "paragraph" — without this it would become
+ * a single enormous page.
+ */
+function splitLongParagraph(paragraph, maxChars) {
+    if (paragraph.length <= maxChars) return [paragraph];
+
+    const sentences = paragraph.split(/(?<=[.!?…»”"])\s+/u);
+    const chunks = [];
+    let current = '';
+
+    for (let sentence of sentences) {
+        // A single sentence longer than a page: hard-split on word boundaries
+        while (sentence.length > maxChars) {
+            let cut = sentence.lastIndexOf(' ', maxChars);
+            if (cut <= 0) cut = maxChars;
+            if (current) {
+                chunks.push(current);
+                current = '';
+            }
+            chunks.push(sentence.slice(0, cut).trim());
+            sentence = sentence.slice(cut).trim();
+        }
+        if (!sentence) continue;
+
+        if (current && current.length + sentence.length + 1 > maxChars) {
+            chunks.push(current);
+            current = sentence;
+        } else {
+            current = current ? `${current} ${sentence}` : sentence;
+        }
+    }
+
+    if (current) chunks.push(current);
+    return chunks;
+}
+
+/**
+ * Split extracted text into readable pages.
+ *
+ * @param {string} fullText - The complete text from one source page/chapter
+ * @param {number} maxChars - Max characters per reading page
  * @returns {string[]} - Array of page texts
  */
 export function splitIntoReadablePages(fullText, maxChars = 1500) {
@@ -70,42 +147,40 @@ export function splitIntoReadablePages(fullText, maxChars = 1500) {
     const pages = [];
     let currentPage = '';
 
+    const pushCurrent = () => {
+        if (currentPage.trim()) pages.push(currentPage.trim());
+        currentPage = '';
+    };
+
     for (const paragraph of paragraphs) {
         const isHeading = isChapterHeading(paragraph);
 
         // Chapter heading: force new page
         if (isHeading && currentPage.trim()) {
-            pages.push(currentPage.trim());
+            pushCurrent();
             currentPage = paragraph + '\n\n';
             continue;
         }
 
-        // Would adding this paragraph exceed the limit?
-        const potentialLength = currentPage.length + paragraph.length + 2; // +2 for \n\n
+        for (const piece of splitLongParagraph(paragraph, maxChars)) {
+            const potentialLength = currentPage.length + piece.length + 2; // +2 for \n\n
 
-        if (potentialLength > maxChars && currentPage.trim()) {
-            // Current page is full, start new one
-            pages.push(currentPage.trim());
-            currentPage = paragraph + '\n\n';
-        } else {
-            // Add paragraph to current page
-            currentPage += paragraph + '\n\n';
+            if (potentialLength > maxChars && currentPage.trim()) {
+                pushCurrent();
+            }
+            currentPage += piece + '\n\n';
         }
     }
 
-    // Don't forget the last page
-    if (currentPage.trim()) {
-        pages.push(currentPage.trim());
-    }
-
+    pushCurrent();
     return pages;
 }
 
 /**
- * Process all PDF pages — split each into readable chunks,
+ * Process all source pages — split each into readable chunks,
  * renumber them sequentially, and detect chapter breaks.
- * 
- * @param {Array<{pageNumber: number, content: string}>} pdfPages - Raw PDF pages
+ *
+ * @param {Array<{pageNumber: number, content: string}>} pdfPages - Raw source pages
  * @param {number} maxChars - Max chars per reading page
  * @returns {{pages: Array<{pageNumber: number, content: string}>, chapters: Array<{number: number, title: string, startPage: number, endPage: number}>}}
  */

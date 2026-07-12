@@ -41,3 +41,11 @@ yarn-error.log*
 next-env.d.ts
 
 /src/generated/prisma
+
+# local runtime artifacts
+/.codex-run/
+/prisma/dev.db*
+/public/audio/
+*.log
+__pycache__/
+.claude/settings.local.json

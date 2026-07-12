@@ -1,7 +1,14 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import Link from 'next/link';
 import ThemeToggle from '@/components/ThemeToggle';
+import LangSwitcher from '@/components/LangSwitcher';
+import ConjugationDrill from '@/components/ConjugationDrill';
+import { tokenizeText, normalizeWord } from '@/lib/normalizer';
+
+// A conjugation drill interrupts the deck every N graded cards.
+const DRILL_EVERY = 15;
 
 // Shuffle array (Fisher-Yates)
 function shuffle(arr) {
@@ -11,6 +18,19 @@ function shuffle(arr) {
         [a[i], a[j]] = [a[j], a[i]];
     }
     return a;
+}
+
+// Render a context sentence with the target word either blanked out (cloze)
+// or emphasized. Matching is on the normalized form so inflection/casing align.
+function renderContext(sentence, word, cloze) {
+    return tokenizeText(sentence).map((t, i) => {
+        if (t.isWord && normalizeWord(t.text) === word) {
+            return cloze
+                ? <span key={i} className="fc-cloze-blank" aria-label="blank" />
+                : <strong key={i} className="fc-context-word">{t.text}</strong>;
+        }
+        return <span key={i}>{t.text}</span>;
+    });
 }
 
 export default function FlashcardsPage() {
@@ -25,6 +45,41 @@ export default function FlashcardsPage() {
     const [loading, setLoading] = useState(false);
     const [reviewing, setReviewing] = useState(false);
     const [direction, setDirection] = useState('both'); // 'both' | 'recognize' | 'produce'
+    const [drill, setDrill] = useState(null); // conjugation drill interrupting the deck
+    const [editing, setEditing] = useState(false); // hand-editing the current card's translation
+    const [editValue, setEditValue] = useState('');
+    const [savingEdit, setSavingEdit] = useState(false);
+    const skipDeckRebuild = useRef(false); // in-place edits must not reshuffle/reset the deck
+    const clipRef = useRef(null);
+
+    // Play just the narrated clip for a context sentence (audioUrl + start..end).
+    const playClip = (ctx) => {
+        const a = clipRef.current;
+        if (!a || !ctx?.audioUrl || ctx.start == null || ctx.end == null) return;
+
+        const seekAndPlay = () => {
+            try { a.currentTime = ctx.start; } catch { /* seek before ready */ }
+            a.play().catch(() => { });
+        };
+        const onTime = () => {
+            if (a.currentTime >= ctx.end) {
+                a.pause();
+                a.removeEventListener('timeupdate', onTime);
+            }
+        };
+        if (a.__onTime) a.removeEventListener('timeupdate', a.__onTime);
+        a.__onTime = onTime;
+        a.addEventListener('timeupdate', onTime);
+
+        const sameSrc = a.src && a.src.endsWith(ctx.audioUrl);
+        if (sameSrc && a.readyState >= 1) {
+            seekAndPlay();
+        } else {
+            if (!sameSrc) a.src = ctx.audioUrl;
+            a.addEventListener('loadedmetadata', seekAndPlay, { once: true });
+            a.load(); // preload=none: force fetch of metadata so we can seek
+        }
+    };
 
     // Load available languages
     useEffect(() => {
@@ -42,7 +97,7 @@ export default function FlashcardsPage() {
             }
         };
         loadLanguages();
-    }, []);
+    }, [language]);
 
     // Load flashcards
     const loadCards = useCallback(async () => {
@@ -68,6 +123,12 @@ export default function FlashcardsPage() {
 
     // Build deck based on direction setting
     useEffect(() => {
+        // A hand-edit patched rawCards in place — keep the current position and
+        // order instead of rebuilding (which would reshuffle and jump to card 1).
+        if (skipDeckRebuild.current) {
+            skipDeckRebuild.current = false;
+            return;
+        }
         if (!rawCards.length) {
             setDeck([]);
             setCurrentIndex(0);
@@ -78,20 +139,26 @@ export default function FlashcardsPage() {
 
         if (direction === 'recognize') {
             // Foreign word → show translation (front: word, back: translation)
-            newDeck = rawCards.map(c => ({ ...c, dir: 'recognize' }));
+            newDeck = rawCards
+                .filter(c => c.skill === 'recognition')
+                .map(c => ({ ...c, dir: 'recognize' }));
         } else if (direction === 'produce') {
             // Translation → recall foreign word (front: translation, back: word)
             // Only include cards that have a translation
             newDeck = rawCards
-                .filter(c => c.translation)
+                .filter(c => c.skill === 'production' && c.translation)
                 .map(c => ({ ...c, dir: 'produce' }));
+        } else if (direction === 'listen') {
+            // Listening — hear the narrated sentence, recall the word/meaning.
+            // Only cards whose word was captured with an aligned audio clip.
+            newDeck = rawCards
+                .filter(c => c.skill === 'listening' && c.context?.audioUrl && c.context.start != null)
+                .map(c => ({ ...c, dir: 'listen' }));
         } else {
             // Both directions — duplicate cards & shuffle
-            const recognize = rawCards.map(c => ({ ...c, dir: 'recognize' }));
-            const produce = rawCards
-                .filter(c => c.translation)
-                .map(c => ({ ...c, dir: 'produce' }));
-            newDeck = shuffle([...recognize, ...produce]);
+            newDeck = shuffle(rawCards
+                .filter(c => c.skill === 'recognition' || (c.skill === 'production' && c.translation))
+                .map(c => ({ ...c, dir: c.skill === 'production' ? 'produce' : 'recognize' })));
         }
 
         setDeck(newDeck);
@@ -101,18 +168,36 @@ export default function FlashcardsPage() {
 
     const currentCard = deck[currentIndex];
 
+    // Auto-play the clip when a listening card appears.
+    useEffect(() => {
+        if (currentCard?.dir === 'listen' && !flipped) {
+            const id = setTimeout(() => playClip(currentCard.context), 250);
+            return () => clearTimeout(id);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentCard?.memoryKey, currentCard?.dir]);
+
+    // Verbs are studied by their infinitive — the card shows the lemma while
+    // the context sentence still highlights the conjugated form encountered.
+    const isVerbCard = currentCard
+        && (currentCard.partOfSpeech === 'VERB' || currentCard.partOfSpeech === 'AUX');
+    const cardWord = (card) => (isVerbCard ? card.word : (card.surfaceForm || card.word));
+
     // What shows on front and back depends on direction
     const getFront = () => {
         if (!currentCard) return { main: '', sub: '' };
         if (currentCard.dir === 'produce') {
             return {
                 main: currentCard.translation,
-                sub: 'What\'s the word?',
+                sub: isVerbCard ? 'Produce the infinitive' : 'Produce the missing form',
                 tag: langNames['pt'] || '🇧🇷 Portuguese',
             };
         }
+        if (currentCard.dir === 'listen') {
+            return { main: '', sub: 'Listen and recall the form', tag: langNames[language] || language };
+        }
         return {
-            main: currentCard.word,
+            main: cardWord(currentCard),
             sub: 'What does it mean?',
             tag: langNames[language] || language,
         };
@@ -120,21 +205,19 @@ export default function FlashcardsPage() {
 
     const getBack = () => {
         if (!currentCard) return { word: '', translation: '' };
-        if (currentCard.dir === 'produce') {
-            return {
-                word: currentCard.word,
-                ipa: currentCard.ipa,
-                translation: currentCard.translation,
-                meanings: currentCard.meanings,
-                tag: langNames[language] || language,
-            };
-        }
+        const surface = currentCard.surfaceForm || currentCard.word;
         return {
-            word: currentCard.word,
+            word: cardWord(currentCard),
+            lemma: currentCard.lemma,
+            // For verb cards the main word IS the lemma; surface the inflected
+            // spelling the book actually used instead.
+            encountered: isVerbCard && surface !== currentCard.word ? surface : null,
             ipa: currentCard.ipa,
             translation: currentCard.translation,
             meanings: currentCard.meanings,
-            tag: langNames['pt'] || '🇧🇷 Portuguese',
+            tag: currentCard.dir === 'produce'
+                ? (langNames[language] || language)
+                : (langNames['pt'] || '🇧🇷 Portuguese'),
         };
     };
 
@@ -148,13 +231,24 @@ export default function FlashcardsPage() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    word: currentCard.word,
-                    language: currentCard.language,
+                    memoryKey: currentCard.memoryKey,
                     quality,
                 }),
             });
 
-            setSessionReviewed(prev => prev + 1);
+            const reviewedNow = sessionReviewed + 1;
+            setSessionReviewed(reviewedNow);
+
+            // Every DRILL_EVERY cards, a verb shows up to be conjugated.
+            if (reviewedNow % DRILL_EVERY === 0) {
+                try {
+                    const res = await fetch(`/api/conjugation?language=${language}`);
+                    const data = await res.json();
+                    if (res.ok && data.drill) setDrill(data.drill);
+                } catch {
+                    // No drill — the deck just continues.
+                }
+            }
 
             if (currentIndex + 1 < deck.length) {
                 setCurrentIndex(prev => prev + 1);
@@ -169,9 +263,45 @@ export default function FlashcardsPage() {
         }
     };
 
+    // Hand-correct the current card's translation (machine translations are
+    // sometimes wrong). Patches the deck in place and persists to the lexeme.
+    const openEditor = () => {
+        if (!currentCard) return;
+        setEditValue(currentCard.translation || '');
+        setEditing(true);
+    };
+
+    const saveEdit = async () => {
+        const next = editValue.trim();
+        if (!currentCard || !next || savingEdit) return;
+        const { lexemeId } = currentCard;
+        const meanings = [{ meaning: next, partOfSpeech: currentCard.partOfSpeech || '' }];
+        const patch = (c) => (c.lexemeId === lexemeId ? { ...c, translation: next, meanings } : c);
+
+        setSavingEdit(true);
+        try {
+            const res = await fetch(`/api/lexemes/${lexemeId}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ translation: next }),
+            });
+            if (!res.ok) throw new Error('save failed');
+            // Update every card of this lexeme without reshuffling/reordering.
+            skipDeckRebuild.current = true;
+            setRawCards(cards => cards.map(patch));
+            setDeck(d => d.map(patch));
+            setEditing(false);
+        } catch (err) {
+            console.error('Card edit failed:', err);
+        } finally {
+            setSavingEdit(false);
+        }
+    };
+
     // Keyboard shortcuts
     useEffect(() => {
         const handleKey = (e) => {
+            if (drill || editing) return; // drill/editor own the keyboard
             if (!currentCard) return;
 
             if (e.key === ' ' || e.key === 'Enter') {
@@ -191,32 +321,20 @@ export default function FlashcardsPage() {
     // Format interval
     const formatInterval = (quality) => {
         if (!currentCard) return '';
-        const interval = currentCard.interval || 0;
-        const ease = currentCard.easeFactor || 2.5;
-
-        let nextInterval;
-        switch (quality) {
-            case 1: return '1m';
-            case 2:
-                nextInterval = interval < 1 ? 10 / 1440 : interval * 1.2;
-                break;
-            case 3:
-                nextInterval = interval < 1 ? 1 : interval * ease;
-                break;
-            case 4:
-                nextInterval = interval < 1 ? 4 : interval * ease * 1.3;
-                break;
-        }
-
-        if (nextInterval < 1 / 24) return `${Math.round(nextInterval * 24 * 60)}m`;
-        if (nextInterval < 1) return `${Math.round(nextInterval * 24)}h`;
-        if (nextInterval < 30) return `${Math.round(nextInterval)}d`;
-        return `${Math.round(nextInterval / 30)}mo`;
+        const due = currentCard.memory?.preview?.[quality]?.due;
+        if (!due) return '';
+        const minutes = Math.max(1, Math.round((new Date(due).getTime() - Date.now()) / 60000));
+        if (minutes < 60) return `${minutes}m`;
+        const hours = Math.round(minutes / 60);
+        if (hours < 24) return `${hours}h`;
+        const days = Math.round(hours / 24);
+        if (days < 30) return `${days}d`;
+        return `${Math.round(days / 30)}mo`;
     };
 
     const langNames = {
         fr: '🇫🇷 French', es: '🇪🇸 Spanish', de: '🇩🇪 German',
-        it: '🇮🇹 Italian', pt: '🇧🇷 Portuguese', ja: '🇯🇵 Japanese',
+        it: '🇮🇹 Italian', pt: '🇧🇷 Portuguese', pl: '🇵🇱 Polish', ja: '🇯🇵 Japanese',
         zh: '🇨🇳 Chinese', ru: '🇷🇺 Russian', ko: '🇰🇷 Korean',
         en: '🇬🇧 English', nl: '🇳🇱 Dutch',
     };
@@ -231,13 +349,24 @@ export default function FlashcardsPage() {
     return (
         <>
             <nav className="navbar">
-                <a href="/" className="navbar-brand">
-                    <span className="navbar-brand-icon">📚</span>
+                <Link href="/" className="navbar-brand">
                     <span className="navbar-brand-text">BookT</span>
-                </a>
+                </Link>
                 <div className="navbar-actions">
-                    <a href="/stats" className="btn btn-ghost">📊 Stats</a>
-                    <a href="/" className="btn btn-ghost">← Library</a>
+                    <Link href="/grammar" className="nav-chip" title="Casos gramaticais">
+                        Casos
+                    </Link>
+                    <Link href="/" className="nav-chip" title="Library">
+                        <svg className="nav-chip-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M2 4.5A2.5 2.5 0 0 1 4.5 2H12v17H4.5A2.5 2.5 0 0 0 2 21.5v-17z" />
+                            <path d="M22 4.5A2.5 2.5 0 0 0 19.5 2H12v17h7.5a2.5 2.5 0 0 1 2.5 2.5v-17z" />
+                        </svg>
+                    </Link>
+                    <Link href="/stats" className="nav-chip" title="Stats">
+                        <svg className="nav-chip-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                            <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />
+                        </svg>
+                    </Link>
                     <ThemeToggle />
                 </div>
             </nav>
@@ -246,15 +375,11 @@ export default function FlashcardsPage() {
                 {/* Header */}
                 <div className="fc-header">
                     <h1 className="fc-title">Flashcards</h1>
-                    <select
-                        className="fc-lang-select"
+                    <LangSwitcher
+                        languages={languages}
                         value={language}
-                        onChange={(e) => setLanguage(e.target.value)}
-                    >
-                        {languages.map(l => (
-                            <option key={l} value={l}>{langNames[l] || l}</option>
-                        ))}
-                    </select>
+                        onChange={setLanguage}
+                    />
                 </div>
 
                 {/* Direction toggle */}
@@ -263,7 +388,7 @@ export default function FlashcardsPage() {
                         className={`fc-dir-btn ${direction === 'both' ? 'active' : ''}`}
                         onClick={() => setDirection('both')}
                     >
-                        🔄 Both
+                        Both
                     </button>
                     <button
                         className={`fc-dir-btn ${direction === 'recognize' ? 'active' : ''}`}
@@ -277,6 +402,13 @@ export default function FlashcardsPage() {
                     >
                         🇧🇷 → {langNames[language]?.split(' ')[0] || '🌍'}
                     </button>
+                    <button
+                        className={`fc-dir-btn ${direction === 'listen' ? 'active' : ''}`}
+                        onClick={() => setDirection('listen')}
+                        title="Listening practice — hear the sentence, recall the word"
+                    >
+                        Listen
+                    </button>
                 </div>
 
                 {/* Stats bar */}
@@ -284,6 +416,10 @@ export default function FlashcardsPage() {
                     <div className="fc-stat">
                         <span className="fc-stat-num fc-stat-due">{stats.due}</span>
                         <span className="fc-stat-label">Due</span>
+                    </div>
+                    <div className="fc-stat">
+                        <span className="fc-stat-num fc-stat-total">{stats.new ?? 0}</span>
+                        <span className="fc-stat-label">New</span>
                     </div>
                     <div className="fc-stat">
                         <span className="fc-stat-num fc-stat-reviewed">{sessionReviewed}</span>
@@ -306,7 +442,13 @@ export default function FlashcardsPage() {
                 )}
 
                 {/* Card area */}
-                {loading ? (
+                {drill ? (
+                    <ConjugationDrill
+                        key={`${drill.lexemeId}:${drill.tense}`}
+                        drill={drill}
+                        onDone={() => setDrill(null)}
+                    />
+                ) : loading ? (
                     <div className="loading-overlay" style={{ padding: '80px' }}>
                         <div className="spinner" />
                     </div>
@@ -317,9 +459,9 @@ export default function FlashcardsPage() {
                         <div className="fc-empty-text">
                             No cards to review right now. Keep reading to add more words!
                         </div>
-                        <a href="/" className="btn btn-primary" style={{ marginTop: '20px' }}>
+                        <Link href="/" className="btn btn-primary" style={{ marginTop: '20px' }}>
                             Back to Library
-                        </a>
+                        </Link>
                     </div>
                 ) : (
                     <>
@@ -331,10 +473,32 @@ export default function FlashcardsPage() {
                                 {/* Front */}
                                 <div className="fc-card-front">
                                     <div className="fc-card-lang-tag">{front.tag}</div>
-                                    <div className="fc-card-word">{front.main}</div>
+                                    {currentCard.dir === 'listen' ? (
+                                        <button
+                                            className="fc-listen-play"
+                                            onClick={(e) => { e.stopPropagation(); playClip(currentCard.context); }}
+                                            title="Replay"
+                                        >
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none" />
+                                                <path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14" />
+                                            </svg>
+                                        </button>
+                                    ) : (
+                                        <div className="fc-card-word">{front.main}</div>
+                                    )}
                                     <div className="fc-card-hint">{front.sub}</div>
+                                    {currentCard.dir !== 'listen' && currentCard.context && (
+                                        <div className="fc-context">
+                                            {/* recognize: word shown in context; produce: blank to fill */}
+                                            {renderContext(
+                                                currentCard.context.sentence,
+                                                currentCard.context.surfaceForm || currentCard.surfaceForm || currentCard.word,
+                                                currentCard.dir === 'produce',
+                                            )}
+                                        </div>
+                                    )}
                                     <div className="fc-card-hint" style={{ marginTop: '4px', fontSize: '11px' }}>
-                                        {currentCard.dir === 'produce' ? '🇧🇷 → ' : ''}{currentCard.dir === 'recognize' ? `${langNames[language]?.split(' ')[0]} → ` : ''}
                                         Press Space
                                     </div>
                                 </div>
@@ -346,11 +510,36 @@ export default function FlashcardsPage() {
                                         <>
                                             <div className="fc-card-word">{back.word}</div>
                                             {back.ipa && <div className="fc-card-ipa">{back.ipa}</div>}
+                                            {back.lemma && back.lemma !== back.word && (
+                                                <div className="fc-card-ipa">Base: {back.lemma}</div>
+                                            )}
+                                            {back.encountered && (
+                                                <div className="fc-card-ipa">In text: {back.encountered}</div>
+                                            )}
+                                        </>
+                                    ) : currentCard.dir === 'listen' ? (
+                                        <>
+                                            <div className="fc-card-word">{back.word}</div>
+                                            {back.ipa && <div className="fc-card-ipa">{back.ipa}</div>}
+                                            {back.lemma && back.lemma !== back.word && (
+                                                <div className="fc-card-ipa">Base: {back.lemma}</div>
+                                            )}
+                                            {back.encountered && (
+                                                <div className="fc-card-ipa">In text: {back.encountered}</div>
+                                            )}
+                                            <div className="fc-card-divider" />
+                                            <div className="fc-card-translation">{back.translation}</div>
                                         </>
                                     ) : (
                                         <>
                                             <div className="fc-card-word" style={{ fontSize: '20px', opacity: 0.6 }}>{back.word}</div>
                                             {back.ipa && <div className="fc-card-ipa">{back.ipa}</div>}
+                                            {back.lemma && back.lemma !== back.word && (
+                                                <div className="fc-card-ipa">Base: {back.lemma}</div>
+                                            )}
+                                            {back.encountered && (
+                                                <div className="fc-card-ipa">In text: {back.encountered}</div>
+                                            )}
                                             <div className="fc-card-divider" />
                                             <div className="fc-card-translation">{back.translation}</div>
                                         </>
@@ -367,9 +556,49 @@ export default function FlashcardsPage() {
                                             ))}
                                         </div>
                                     )}
+                                    {currentCard.context && (
+                                        <div className="fc-context-back">
+                                            <div className="fc-context">
+                                                {renderContext(
+                                                    currentCard.context.sentence,
+                                                    currentCard.context.surfaceForm || currentCard.surfaceForm || currentCard.word,
+                                                    false,
+                                                )}
+                                            </div>
+                                            {currentCard.context.audioUrl && currentCard.context.start != null && (
+                                                <button
+                                                    className="fc-context-audio"
+                                                    onClick={(e) => { e.stopPropagation(); playClip(currentCard.context); }}
+                                                    title="Play this sentence"
+                                                >
+                                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none" />
+                                                        <path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14" />
+                                                    </svg>
+                                                    Listen
+                                                </button>
+                                            )}
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         </div>
+                        <audio ref={clipRef} hidden preload="none" />
+                        {currentCard.context?.audioUrl && currentCard.context.start != null && !flipped && (
+                            <div className="fc-listen-hint">
+                                <button
+                                    className="fc-context-audio"
+                                    onClick={(e) => { e.stopPropagation(); playClip(currentCard.context); }}
+                                    title="Play this sentence"
+                                >
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none" />
+                                        <path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14" />
+                                    </svg>
+                                    Listen
+                                </button>
+                            </div>
+                        )}
 
                         {/* Action buttons */}
                         {flipped && (
@@ -397,6 +626,56 @@ export default function FlashcardsPage() {
                             </div>
                         )}
                     </>
+                )}
+
+                {/* Discreet corner button to hand-fix a wrong translation */}
+                {currentCard && !drill && !loading && (
+                    <button
+                        className="fc-edit-toggle"
+                        onClick={openEditor}
+                        title="Editar a tradução deste card"
+                        aria-label="Editar card"
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M12 20h9" />
+                            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+                        </svg>
+                    </button>
+                )}
+
+                {editing && currentCard && (
+                    <div className="fc-edit-overlay" onClick={() => !savingEdit && setEditing(false)}>
+                        <div className="fc-edit-panel" onClick={(e) => e.stopPropagation()}>
+                            <div className="fc-edit-word">
+                                {currentCard.surfaceForm || currentCard.word}
+                                {currentCard.lemma && currentCard.lemma !== (currentCard.surfaceForm || currentCard.word) && (
+                                    <span className="fc-edit-lemma"> · {currentCard.lemma}</span>
+                                )}
+                            </div>
+                            {currentCard.context?.sentence && (
+                                <div className="fc-edit-context">{currentCard.context.sentence}</div>
+                            )}
+                            <label className="fc-edit-label">Tradução</label>
+                            <input
+                                className="fc-edit-input"
+                                value={editValue}
+                                autoFocus
+                                onChange={(e) => setEditValue(e.target.value)}
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Enter') saveEdit();
+                                    else if (e.key === 'Escape') setEditing(false);
+                                }}
+                            />
+                            <div className="fc-edit-actions">
+                                <button className="fc-edit-cancel" onClick={() => setEditing(false)} disabled={savingEdit}>
+                                    Cancelar
+                                </button>
+                                <button className="btn btn-primary" onClick={saveEdit} disabled={savingEdit || !editValue.trim()}>
+                                    {savingEdit ? 'Salvando…' : 'Salvar'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
                 )}
             </div>
         </>

@@ -1,5 +1,6 @@
 import prisma from '@/lib/prisma';
 import { NextResponse } from 'next/server';
+import { LEVEL } from '@/lib/status';
 
 // GET /api/vocabulary/stats?language=fr — Get word counts per status
 export async function GET(request) {
@@ -9,43 +10,44 @@ export async function GET(request) {
 
         const where = language ? { language } : {};
 
-        const [total, known, learning] = await Promise.all([
-            prisma.userWord.count({ where }),
-            prisma.userWord.count({ where: { ...where, status: 'KNOWN' } }),
-            prisma.userWord.count({
-                where: {
-                    ...where,
-                    status: { notIn: ['KNOWN', '4'] },
-                },
+        const [total, level1, level2, level3, knownCount, forms, skillGroups] = await Promise.all([
+            prisma.lexeme.count({ where }),
+            prisma.lexeme.count({
+                where: { ...where, status: LEVEL.NEW },
+            }),
+            prisma.lexeme.count({
+                where: { ...where, status: LEVEL.RECOGNIZED },
+            }),
+            prisma.lexeme.count({
+                where: { ...where, status: LEVEL.FAMILIAR },
+            }),
+            prisma.lexeme.count({
+                where: { ...where, status: LEVEL.KNOWN },
+            }),
+            prisma.userWord.count({ where: { ...where, isStudyable: true } }),
+            prisma.skillMemory.groupBy({
+                by: ['skill'],
+                where: language ? { lexeme: { language } } : { lexemeId: { not: null } },
+                _count: { id: true },
+                _sum: { reps: true },
             }),
         ]);
 
-        // Also count by numeric levels
-        const levels = {};
-        for (const level of ['1', '2', '3']) {
-            levels[level] = await prisma.userWord.count({
-                where: { ...where, status: level },
-            });
-        }
-
-        // Count status=4 and status=KNOWN together as "known"
-        const knownCount = await prisma.userWord.count({
-            where: {
-                ...where,
-                status: { in: ['KNOWN', '4'] },
-            },
-        });
-
         return NextResponse.json({
             total,
+            forms,
             known: knownCount,
             learning: total - knownCount,
             levels: {
-                1: levels['1'] || 0,
-                2: levels['2'] || 0,
-                3: levels['3'] || 0,
+                1: level1,
+                2: level2,
+                3: level3,
                 4: knownCount,
             },
+            skills: Object.fromEntries(skillGroups.map((group) => [group.skill, {
+                total: group._count.id,
+                reviews: group._sum.reps || 0,
+            }])),
         });
     } catch (error) {
         return NextResponse.json({ error: error.message }, { status: 500 });

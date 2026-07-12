@@ -2,6 +2,31 @@ import { NextResponse } from 'next/server';
 import { writeFile, mkdir } from 'fs/promises';
 import path from 'path';
 import prisma from '@/lib/prisma';
+import { aiFetch, AIServiceError } from '@/lib/aiService';
+
+// Kick off an async alignment job on the AI service for a chapter's audio.
+// Returns { jobId } — progress and persistence happen via the /sync route.
+async function startAlignJob(chapter, filePath) {
+    const chapterPages = chapter.book.pages
+        .filter(p => p.pageNumber >= chapter.startPage && p.pageNumber <= chapter.endPage)
+        .map(p => p.content);
+
+    const res = await aiFetch('/align-start', {
+        body: { audio_path: filePath, pages: chapterPages, language: chapter.book.language },
+        timeoutMs: 15000,
+    });
+    const data = await res.json();
+    return data.job;
+}
+
+async function loadChapter(bookId, chapterId) {
+    const chapter = await prisma.chapter.findUnique({
+        where: { id: chapterId },
+        include: { book: { include: { pages: { orderBy: { pageNumber: 'asc' } } } } },
+    });
+    if (!chapter || chapter.bookId !== bookId) return null;
+    return chapter;
+}
 
 // GET /api/books/[id]/chapters — List chapters for a book
 export async function GET(request, { params }) {
@@ -17,7 +42,9 @@ export async function GET(request, { params }) {
     }
 }
 
-// POST /api/books/[id]/chapters/audio — Upload audio for a specific chapter
+// POST /api/books/[id]/chapters — Upload audio for a specific chapter and
+// start alignment. Responds as soon as the file is stored; the client follows
+// job progress through GET /api/books/[id]/chapters/sync.
 export async function POST(request, { params }) {
     try {
         const { id: bookId } = await params;
@@ -29,17 +56,8 @@ export async function POST(request, { params }) {
             return NextResponse.json({ error: 'audio and chapterId are required' }, { status: 400 });
         }
 
-        // Get chapter and book info
-        const chapter = await prisma.chapter.findUnique({
-            where: { id: chapterId },
-            include: {
-                book: {
-                    include: { pages: { orderBy: { pageNumber: 'asc' } } }
-                }
-            },
-        });
-
-        if (!chapter || chapter.bookId !== bookId) {
+        const chapter = await loadChapter(bookId, chapterId);
+        if (!chapter) {
             return NextResponse.json({ error: 'Chapter not found' }, { status: 404 });
         }
 
@@ -53,80 +71,54 @@ export async function POST(request, { params }) {
         await writeFile(filePath, buffer);
 
         const audioUrl = `/audio/${filename}`;
-
-        // Update chapter with audio URL
         await prisma.chapter.update({
             where: { id: chapterId },
             data: { audioUrl },
         });
 
-        // Get only the pages for this chapter
-        const chapterPages = chapter.book.pages
-            .filter(p => p.pageNumber >= chapter.startPage && p.pageNumber <= chapter.endPage)
-            .map(p => p.content);
-
-        // Call Python alignment service
         try {
-            const alignRes = await fetch('http://127.0.0.1:8000/align', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    audio_path: filePath,
-                    pages: chapterPages,
-                    language: chapter.book.language,
-                }),
-            });
-
-            if (alignRes.ok) {
-                const alignData = await alignRes.json();
-                console.log(`[AudioSync] Python returned: duration=${alignData.duration}, alignment_count=${alignData.alignment?.length}`);
-
-                // Clear old sync data for this chapter
-                await prisma.audioSync.deleteMany({ where: { chapterId } });
-
-                // Store alignment entries (adjust page numbers to absolute)
-                if (alignData.alignment && alignData.alignment.length > 0) {
-                    const createData = alignData.alignment.map(entry => ({
-                        bookId,
-                        chapterId,
-                        pageNumber: entry.pageNumber + chapter.startPage - 1, // relative -> absolute
-                        startTime: entry.startTime,
-                        endTime: entry.endTime,
-                        text: entry.text,
-                    }));
-                    console.log(`[AudioSync] First mapped DB entry:`, createData[0]);
-
-                    await prisma.audioSync.createMany({
-                        data: createData,
-                    });
-                    console.log(`[AudioSync] Successfully saved ${createData.length} entries to DB`);
-                } else {
-                    console.log(`[AudioSync] WARNING: Python returned OK but alignment array is empty or missing!`);
-                }
-
-                return NextResponse.json({
-                    audioUrl,
-                    syncCount: alignData.alignment?.length || 0,
-                    duration: alignData.duration,
-                    status: 'synced',
-                });
-            } else {
-                return NextResponse.json({
-                    audioUrl,
-                    status: 'uploaded_no_sync',
-                    error: 'Alignment service returned an error',
-                });
-            }
+            const jobId = await startAlignJob(chapter, filePath);
+            return NextResponse.json({ audioUrl, jobId, status: 'aligning' });
         } catch (alignErr) {
-            console.error('Alignment service unreachable:', alignErr.message);
-            return NextResponse.json({
-                audioUrl,
-                status: 'uploaded_no_sync',
-                error: 'Python service unreachable',
-            });
+            const message = alignErr instanceof AIServiceError ? alignErr.message : 'Alignment failed';
+            console.error('Chapter alignment start failed:', message);
+            return NextResponse.json({ audioUrl, status: 'uploaded_no_sync', error: message });
         }
     } catch (error) {
         console.error('Chapter audio upload error:', error);
+        return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+}
+
+// PUT /api/books/[id]/chapters — Re-sync a chapter using its already-uploaded
+// audio (upgrades old coarse sync). Body: { chapterId }. Job-based like POST.
+export async function PUT(request, { params }) {
+    try {
+        const { id: bookId } = await params;
+        const { chapterId } = await request.json();
+        if (!chapterId) {
+            return NextResponse.json({ error: 'chapterId is required' }, { status: 400 });
+        }
+
+        const chapter = await loadChapter(bookId, chapterId);
+        if (!chapter) {
+            return NextResponse.json({ error: 'Chapter not found' }, { status: 404 });
+        }
+        if (!chapter.audioUrl) {
+            return NextResponse.json({ error: 'Chapter has no audio to re-sync' }, { status: 400 });
+        }
+
+        const filePath = path.join(process.cwd(), 'public', ...chapter.audioUrl.split('/').filter(Boolean));
+        try {
+            const jobId = await startAlignJob(chapter, filePath);
+            return NextResponse.json({ audioUrl: chapter.audioUrl, jobId, status: 'aligning' });
+        } catch (alignErr) {
+            const message = alignErr instanceof AIServiceError ? alignErr.message : 'Alignment failed';
+            console.error('Chapter re-sync start failed:', message);
+            return NextResponse.json({ audioUrl: chapter.audioUrl, status: 'uploaded_no_sync', error: message });
+        }
+    } catch (error) {
+        console.error('Chapter re-sync error:', error);
         return NextResponse.json({ error: error.message }, { status: 500 });
     }
 }
